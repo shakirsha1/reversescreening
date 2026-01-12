@@ -1,0 +1,203 @@
+#!/bin/bash
+# Quick Start Script for PharmacoNet Reverse Screening
+
+set -e  # Exit on error
+
+echo "=========================================="
+echo "PharmacoNet Reverse Screening - Quick Start"
+echo "=========================================="
+
+# Check if input files exist
+echo ""
+echo "Checking input files..."
+if [ ! -f input/pdb_database.csv ]; then
+    echo "ERROR: input/pdb_database.csv not found!"
+    echo "Please create this file with format:"
+    echo "PDB_code,Ligand_ID,Chain"
+    echo "5XRA,8D3,A"
+    exit 1
+fi
+
+if [ ! -f input/query_molecules.csv ]; then
+    echo "ERROR: input/query_molecules.csv not found!"
+    echo "Please create this file with format:"
+    echo "Name,SMILES"
+    echo "aspirin,CC(=O)Oc1ccccc1C(=O)O"
+    exit 1
+fi
+
+echo "✓ Input files found"
+
+# Count entries
+PDB_COUNT=$(tail -n +2 input/pdb_database.csv | wc -l)
+QUERY_COUNT=$(tail -n +2 input/query_molecules.csv | wc -l)
+
+echo "  Proteins: $PDB_COUNT"
+echo "  Queries: $QUERY_COUNT"
+
+# Check if conda/mamba is available
+echo ""
+echo "Checking environment..."
+if command -v mamba &> /dev/null; then
+    ENV_MANAGER="mamba"
+elif command -v conda &> /dev/null; then
+    ENV_MANAGER="conda"
+else
+    echo "ERROR: Neither conda nor mamba found!"
+    echo "Please install Miniconda or Miniforge first"
+    exit 1
+fi
+
+echo "✓ Using $ENV_MANAGER"
+
+# Create environment if needed
+if ! $ENV_MANAGER env list | grep -q "pmnet"; then
+    echo ""
+    echo "Creating pmnet environment..."
+    $ENV_MANAGER env create -f environment.yml
+    echo "✓ Environment created"
+else
+    echo "✓ Environment already exists"
+fi
+
+# Activate environment
+echo ""
+echo "Activating environment..."
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate pmnet
+
+# Check Python packages
+echo "Verifying packages..."
+python -c "import torch; import rdkit; import pandas" 2>/dev/null || {
+    echo "ERROR: Missing required packages"
+    echo "Installing dependencies..."
+    pip install -r requirements.txt
+}
+echo "✓ All packages available"
+
+# Step 1: Build database
+echo ""
+echo "=========================================="
+echo "STEP 1: Building Pharmacophore Database"
+echo "=========================================="
+echo "This will process $PDB_COUNT proteins..."
+echo "Estimated time: ~$((PDB_COUNT * 5 / 60)) minutes (CPU) or ~$((PDB_COUNT / 2)) minutes (GPU)"
+echo ""
+
+read -p "Use GPU acceleration? (y/n): " use_gpu
+
+if [ "$use_gpu" = "y" ] || [ "$use_gpu" = "Y" ]; then
+    GPU_FLAG="--cuda"
+    echo "Using GPU mode"
+else
+    GPU_FLAG=""
+    echo "Using CPU mode"
+fi
+
+echo ""
+echo "Starting database build..."
+
+python batch_modeling.py \
+    --input_csv input/pdb_database.csv \
+    --output_dir output \
+    $GPU_FLAG \
+    --verbose
+
+MODEL_COUNT=$(find output -name "*.pm" 2>/dev/null | wc -l)
+
+if [ "$MODEL_COUNT" -eq 0 ]; then
+    echo "ERROR: No models were generated!"
+    echo "Check errors above"
+    exit 1
+fi
+
+echo ""
+echo "✓ Database built successfully: $MODEL_COUNT models"
+
+# Step 2: Run screening
+echo ""
+echo "=========================================="
+echo "STEP 2: Running Reverse Screening"
+echo "=========================================="
+echo "Screening $QUERY_COUNT queries against $MODEL_COUNT proteins..."
+echo ""
+
+# Get user input for parameters
+read -p "Number of conformers per molecule [50]: " NUM_CONF
+NUM_CONF=${NUM_CONF:-50}
+
+read -p "Minimum score threshold [5.0]: " MIN_SCORE
+MIN_SCORE=${MIN_SCORE:-5.0}
+
+read -p "Top N results per query [50]: " TOP_N
+TOP_N=${TOP_N:-50}
+
+read -p "Number of CPU cores [$(nproc)]: " CPUS
+CPUS=${CPUS:-$(nproc)}
+
+echo ""
+echo "Starting screening with:"
+echo "  Conformers: $NUM_CONF"
+echo "  Min score: $MIN_SCORE"
+echo "  Top N: $TOP_N"
+echo "  CPUs: $CPUS"
+echo ""
+
+mkdir -p results
+
+python reverse_screening.py \
+    --query_csv input/query_molecules.csv \
+    --model_database_dir output \
+    --out results/screening_results.csv \
+    --num_conformers $NUM_CONF \
+    --min_score $MIN_SCORE \
+    --top_n $TOP_N \
+    --cpus $CPUS
+
+if [ ! -f results/screening_results.csv ]; then
+    echo "ERROR: No results file generated!"
+    exit 1
+fi
+
+RESULT_COUNT=$(tail -n +2 results/screening_results.csv | wc -l)
+echo ""
+echo "✓ Screening complete: $RESULT_COUNT matches found"
+
+# Step 3: Analyze results
+echo ""
+echo "=========================================="
+echo "STEP 3: Analyzing Results"
+echo "=========================================="
+
+if [ "$RESULT_COUNT" -eq 0 ]; then
+    echo "WARNING: No matches found (all scores below threshold)"
+    echo "Try lowering the --min_score parameter"
+else
+    echo "Generating analysis and plots..."
+    python scripts/analyze_results.py \
+        results/screening_results.csv \
+        --output_dir results/analysis
+    
+    echo "✓ Analysis complete"
+fi
+
+# Summary
+echo ""
+echo "=========================================="
+echo "COMPLETE! ✓"
+echo "=========================================="
+echo ""
+echo "Results saved to:"
+echo "  📄 results/screening_results.csv - Raw data"
+if [ "$RESULT_COUNT" -gt 0 ]; then
+    echo "  📊 results/analysis/ - Plots and statistics"
+fi
+echo ""
+echo "Quick view of top 5 results:"
+echo ""
+head -6 results/screening_results.csv | column -t -s',' || head -6 results/screening_results.csv
+echo ""
+echo "To view full report:"
+echo "  cat results/analysis/analysis_report.txt"
+echo ""
+echo "Happy target fishing! 🎯🧬"
