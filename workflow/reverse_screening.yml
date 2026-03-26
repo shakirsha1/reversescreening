@@ -1,6 +1,7 @@
 name: PharmacoNet Reverse Screening
 
 on:
+  # Trigger on push to main when input files change
   push:
     branches: [ main, master ]
     paths:
@@ -8,6 +9,7 @@ on:
       - 'input/query_molecules.csv'
       - '.github/workflows/reverse_screening.yml'
   
+  # Allow manual triggering
   workflow_dispatch:
     inputs:
       num_conformers:
@@ -26,51 +28,32 @@ on:
 jobs:
   reverse-screening:
     runs-on: ubuntu-latest
-    timeout-minutes: 720
+    timeout-minutes: 720  # 12 hours max
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        lfs: true
-    
-    - name: Validate input files
-      run: |
-        echo "Checking input files..."
-        
-        if [ ! -f input/pdb_database.csv ]; then
-          echo "ERROR: input/pdb_database.csv not found!"
-          exit 1
-        fi
-        
-        if [ ! -f input/query_molecules.csv ]; then
-          echo "ERROR: input/query_molecules.csv not found!"
-          exit 1
-        fi
-        
-        # Check if CSVs have content
-        PDB_LINES=$(wc -l < input/pdb_database.csv)
-        QUERY_LINES=$(wc -l < input/query_molecules.csv)
-        
-        if [ "$PDB_LINES" -lt 2 ]; then
-          echo "ERROR: pdb_database.csv is empty or has only header!"
-          exit 1
-        fi
-        
-        if [ "$QUERY_LINES" -lt 2 ]; then
-          echo "ERROR: query_molecules.csv is empty or has only header!"
-          exit 1
-        fi
-        
-        echo "✓ Input files validated"
-        echo "  PDB entries: $((PDB_LINES - 1))"
-        echo "  Query molecules: $((QUERY_LINES - 1))"
+        lfs: true  # Enable Git LFS for large files
     
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         cache: 'pip'
+    
+    - name: Free up disk space
+      run: |
+        echo "Disk space before cleanup:"
+        df -h
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        docker system prune -af || true
+        echo "Disk space after cleanup:"
+        df -h
     
     - name: Install system dependencies
       run: |
@@ -81,31 +64,38 @@ jobs:
           libsm6 \
           libgl1
     
-    - name: Install Python dependencies
+    - name: Install Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        auto-update-conda: true
+        python-version: '3.11'
+        miniforge-variant: Miniforge3
+        use-mamba: true
+        channels: conda-forge,defaults
+        channel-priority: strict
+    
+    - name: Create conda environment
+      shell: bash -l {0}
       run: |
-        python -m pip install --upgrade pip
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install rdkit pandas matplotlib seaborn scikit-learn biopython
-        
-        # Install PharmacoNet if setup.py exists
-        if [ -f setup.py ]; then
-          pip install -e .
-        else
-          echo "WARNING: setup.py not found, skipping pmnet installation"
-        fi
+        echo "Creating CPU-only environment to save disk space..."
+        mamba env create -f environment.yml
+    
+    - name: Install PharmacoNet (CPU-only)
+      shell: bash -l {0}
+      run: |
+        conda activate pmnet
+        # Install PharmacoNet without automatic dependency resolution
+        # Dependencies are already handled by environment.yml
+        pip install -e . --no-deps
+        echo "Installation complete - CPU-only mode"
     
     - name: Verify installation
+      shell: bash -l {0}
       run: |
-        python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-        python -c "import rdkit; print(f'RDKit: {rdkit.__version__}')"
-        python -c "import pandas; print(f'Pandas: {pandas.__version__}')"
-        
-        # Check if pmnet is available
-        if python -c "import pmnet" 2>/dev/null; then
-          python -c "import pmnet; print(f'PharmacoNet: {pmnet.__version__}')"
-        else
-          echo "WARNING: pmnet module not found (this is okay if using standalone scripts)"
-        fi
+        conda activate pmnet
+        python -c "import pmnet; print(f'PharmacoNet version: {pmnet.__version__}')"
+        python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+        python -c "import rdkit; print(f'RDKit version: {rdkit.__version__}')"
     
     - name: Count input entries
       id: count_inputs
@@ -122,58 +112,44 @@ jobs:
         mkdir -p results
         mkdir -p results/analysis
     
+    - name: Download PharmacoNet weights
+      shell: bash -l {0}
+      run: |
+        conda activate pmnet
+        python -c "from pmnet.utils.download_weight import download_pretrained_model; import pathlib; weight_path = pathlib.Path.home() / '.local' / 'share' / 'pmnet' / 'pmnet.tar'; weight_path.parent.mkdir(parents=True, exist_ok=True); download_pretrained_model(weight_path, verbose=True)"
+    
     - name: Build protein pharmacophore database
       id: build_database
-      continue-on-error: true
+      shell: bash -l {0}
       run: |
+        conda activate pmnet
         echo "Building pharmacophore models for ${{ steps.count_inputs.outputs.pdb_count }} proteins..."
         echo "This may take several hours for large databases."
         
-        if [ -f batch_modeling.py ]; then
-          python batch_modeling.py \
-            --input_csv input/pdb_database.csv \
-            --output_dir output \
-            2>&1 | tee build_database.log
-        else
-          echo "ERROR: batch_modeling.py not found!"
-          echo "Please add batch_modeling.py to your repository"
-          exit 1
-        fi
+        python batch_modeling.py \
+          --input_csv input/pdb_database.csv \
+          --output_dir output \
+          2>&1 | tee build_database.log
         
         # Count generated models
-        MODEL_COUNT=$(find output -name "*.pm" 2>/dev/null | wc -l)
+        MODEL_COUNT=$(find output -name "*.pm" | wc -l)
         echo "model_count=$MODEL_COUNT" >> $GITHUB_OUTPUT
         echo "Generated $MODEL_COUNT pharmacophore models"
     
     - name: Validate database
       run: |
-        MODEL_COUNT=${{ steps.build_database.outputs.model_count }}
-        
-        if [ "$MODEL_COUNT" = "" ] || [ "$MODEL_COUNT" -eq 0 ]; then
+        if [ "${{ steps.build_database.outputs.model_count }}" -eq 0 ]; then
           echo "ERROR: No pharmacophore models were generated!"
-          echo ""
-          echo "Possible causes:"
-          echo "1. batch_modeling.py failed to run"
-          echo "2. Invalid PDB codes in pdb_database.csv"
-          echo "3. Network issues downloading PDB files"
-          echo "4. Python environment issues"
-          echo ""
-          echo "Check build_database.log for details"
-          
-          if [ -f build_database.log ]; then
-            echo ""
-            echo "Last 50 lines of build_database.log:"
-            tail -50 build_database.log
-          fi
-          
           exit 1
         fi
-        
-        echo "✓ Database validation passed: $MODEL_COUNT models"
+        echo "Database validation passed: ${{ steps.build_database.outputs.model_count }} models"
     
     - name: Run reverse screening
-      continue-on-error: true
+      shell: bash -l {0}
       run: |
+        conda activate pmnet
+        
+        # Get input parameters (use workflow_dispatch inputs if available, otherwise defaults)
         NUM_CONFORMERS=${{ github.event.inputs.num_conformers || '50' }}
         MIN_SCORE=${{ github.event.inputs.min_score || '5.0' }}
         TOP_N=${{ github.event.inputs.top_n || '50' }}
@@ -184,50 +160,45 @@ jobs:
         echo "  Top N: $TOP_N"
         echo "  CPUs: $(nproc)"
         
-        if [ -f reverse_screening.py ]; then
-          python reverse_screening.py \
-            --query_csv input/query_molecules.csv \
-            --model_database_dir output \
-            --out results/screening_results.csv \
-            --num_conformers $NUM_CONFORMERS \
-            --min_score $MIN_SCORE \
-            --top_n $TOP_N \
-            --cpus $(nproc) \
-            2>&1 | tee screening.log
-        else
-          echo "ERROR: reverse_screening.py not found!"
-          exit 1
-        fi
+        python reverse_screening.py \
+          --query_csv input/query_molecules.csv \
+          --model_database_dir output \
+          --out results/screening_results.csv \
+          --num_conformers $NUM_CONFORMERS \
+          --min_score $MIN_SCORE \
+          --top_n $TOP_N \
+          --cpus $(nproc) \
+          2>&1 | tee screening.log
     
     - name: Analyze results
-      continue-on-error: true
+      shell: bash -l {0}
       run: |
+        conda activate pmnet
+        
         if [ ! -f results/screening_results.csv ]; then
           echo "ERROR: Screening results not found!"
           exit 1
         fi
         
-        RESULT_COUNT=$(tail -n +2 results/screening_results.csv 2>/dev/null | wc -l)
+        # Check if results file is not empty
+        RESULT_COUNT=$(tail -n +2 results/screening_results.csv | wc -l)
         echo "Found $RESULT_COUNT screening results"
         
         if [ "$RESULT_COUNT" -eq 0 ]; then
           echo "WARNING: No screening results (all scores below threshold)"
+          echo "Creating empty analysis report..."
           mkdir -p results/analysis
           echo "No results found - all scores below threshold" > results/analysis/analysis_report.txt
         else
           echo "Analyzing results..."
-          if [ -f scripts/analyze_results.py ]; then
-            python scripts/analyze_results.py results/screening_results.csv \
-              --output_dir results/analysis \
-              2>&1 | tee analysis.log
-          else
-            echo "WARNING: scripts/analyze_results.py not found, skipping analysis"
-          fi
+          python scripts/analyze_results.py results/screening_results.csv \
+            --output_dir results/analysis \
+            2>&1 | tee analysis.log
         fi
     
     - name: Generate summary report
       run: |
-        cat > results/SUMMARY.md << EOF
+        cat > results/SUMMARY.md << 'EOF'
         # PharmacoNet Reverse Screening Results
         
         ## Run Information
@@ -248,21 +219,30 @@ jobs:
         - **CPUs used:** $(nproc)
         
         ## Output Files
+        - `screening_results.csv` - Raw screening results
+        - `analysis/score_distribution.png` - Score distribution plot
+        - `analysis/score_by_query_boxplot.png` - Per-query comparison
+        - `analysis/query_target_heatmap.png` - Query-target heatmap
+        - `analysis/analysis_report.txt` - Detailed statistical report
+        
+        ## Quick Results Preview
+        
         EOF
         
+        # Add top 5 results if available
         if [ -f results/screening_results.csv ]; then
-          echo "- \`screening_results.csv\` - Raw screening results" >> results/SUMMARY.md
-        fi
-        
-        if [ -f results/analysis/score_distribution.png ]; then
-          echo "- \`analysis/score_distribution.png\` - Score distribution plot" >> results/SUMMARY.md
-        fi
-        
-        if [ -f results/screening_results.csv ]; then
-          echo "" >> results/SUMMARY.md
           echo "### Top 5 Matches (Highest Scores)" >> results/SUMMARY.md
           echo '```' >> results/SUMMARY.md
-          head -6 results/screening_results.csv | column -t -s',' >> results/SUMMARY.md || head -6 results/screening_results.csv >> results/SUMMARY.md
+          head -6 results/screening_results.csv | column -t -s',' >> results/SUMMARY.md
+          echo '```' >> results/SUMMARY.md
+        fi
+        
+        # Add analysis summary if available
+        if [ -f results/analysis/analysis_report.txt ]; then
+          echo "" >> results/SUMMARY.md
+          echo "### Analysis Summary" >> results/SUMMARY.md
+          echo '```' >> results/SUMMARY.md
+          head -30 results/analysis/analysis_report.txt >> results/SUMMARY.md
           echo '```' >> results/SUMMARY.md
         fi
         
@@ -275,6 +255,7 @@ jobs:
         name: screening-results-${{ github.run_id }}
         path: |
           results/
+          !results/**/.gitkeep
         retention-days: 90
     
     - name: Upload pharmacophore models
@@ -292,5 +273,35 @@ jobs:
       with:
         name: logs-${{ github.run_id }}
         path: |
-          *.log
+          build_database.log
+          screening.log
+          analysis.log
         retention-days: 30
+    
+    - name: Comment on commit (if results found)
+      if: github.event_name == 'push' && success()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          // Read summary
+          let summary = 'Reverse screening completed!';
+          if (fs.existsSync('results/SUMMARY.md')) {
+            summary = fs.readFileSync('results/SUMMARY.md', 'utf8');
+          }
+          
+          // Create comment
+          await github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: summary
+          });
+    
+    - name: Fail if no models generated
+      if: steps.build_database.outputs.model_count == '0'
+      run: |
+        echo "FATAL: No pharmacophore models were generated!"
+        echo "Check build_database.log for errors."
+        exit 1
