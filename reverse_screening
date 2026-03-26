@@ -1,296 +1,339 @@
-name: PharmacoNet Reverse Screening
+#!/usr/bin/env python3
+"""
+PharmacoNet Reverse Screening (Target Fishing)
+===============================================
 
-on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'input/pdb_database.csv'
-      - 'input/query_molecules.csv'
-      - '.github/workflows/reverse_screening.yml'
-  
-  workflow_dispatch:
-    inputs:
-      num_conformers:
-        description: 'Number of conformers to generate'
-        required: false
-        default: '50'
-      min_score:
-        description: 'Minimum score threshold'
-        required: false
-        default: '5.0'
-      top_n:
-        description: 'Top N results per query'
-        required: false
-        default: '50'
+Screen query molecules against a database of protein pharmacophore models
+to identify potential binding targets.
 
-jobs:
-  reverse-screening:
-    runs-on: ubuntu-latest
-    timeout-minutes: 720
+Author: PharmacoNet Team
+License: MIT
+"""
+
+import argparse
+import csv
+import multiprocessing
+import sys
+from functools import partial
+from pathlib import Path
+
+from pmnet.pharmacophore_model import PharmacophoreModel
+
+
+class ReverseScreening_ArgParser(argparse.ArgumentParser):
+    def __init__(self):
+        super().__init__(
+            "reverse screening - target fishing",
+            description="Screen query molecules against protein pharmacophore database",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        
+        cfg_args = self.add_argument_group("config")
+        cfg_args.add_argument(
+            "-q",
+            "--query_molecule",
+            type=str,
+            help="single query: SMILES string or molecule file (.sdf, .mol2, .pdb)",
+        )
+        cfg_args.add_argument(
+            "--query_csv",
+            type=str,
+            help="batch query: CSV file with columns 'Name,SMILES' or 'Name,File'",
+        )
+        cfg_args.add_argument(
+            "-d",
+            "--model_database_dir",
+            type=str,
+            help="directory containing pharmacophore model database (.pm files)",
+            required=True,
+        )
+        cfg_args.add_argument(
+            "-o", 
+            "--out", 
+            type=str, 
+            help="result file path (CSV)", 
+            required=True
+        )
+        cfg_args.add_argument(
+            "--cpus", 
+            type=int, 
+            help="number of cpus for parallel processing", 
+            default=1
+        )
+        cfg_args.add_argument(
+            "--num_conformers",
+            type=int,
+            help="number of conformers to generate for SMILES queries",
+            default=50,
+        )
+        cfg_args.add_argument(
+            "--top_n",
+            type=int,
+            help="return only top N results per query (default: all)",
+            default=None,
+        )
+        cfg_args.add_argument(
+            "--min_score",
+            type=float,
+            help="minimum score threshold for filtering results",
+            default=0.0,
+        )
+
+        param_args = self.add_argument_group("pharmacophore feature weights")
+        param_args.add_argument(
+            "--hydrophobic",
+            type=float,
+            help="weight for hydrophobic features",
+            default=1.0,
+        )
+        param_args.add_argument(
+            "--aromatic", 
+            type=float, 
+            help="weight for aromatic ring features", 
+            default=4.0
+        )
+        param_args.add_argument(
+            "--hba", 
+            type=float, 
+            help="weight for H-bond acceptor features", 
+            default=4.0
+        )
+        param_args.add_argument(
+            "--hbd", 
+            type=float, 
+            help="weight for H-bond donor features", 
+            default=4.0
+        )
+        param_args.add_argument(
+            "--halogen", 
+            type=float, 
+            help="weight for halogen bond features", 
+            default=4.0
+        )
+        param_args.add_argument(
+            "--anion", 
+            type=float, 
+            help="weight for anionic features", 
+            default=8.0
+        )
+        param_args.add_argument(
+            "--cation", 
+            type=float, 
+            help="weight for cationic features", 
+            default=8.0
+        )
+
+
+def is_smiles(query_str):
+    """Check if query is a file path or SMILES string"""
+    return not Path(query_str).exists()
+
+
+def score_model(model_path, query_molecule, weight, is_smiles_query, num_conformers):
+    """Score a single pharmacophore model against query molecule
     
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        lfs: true
+    Args:
+        model_path: Path to .pm pharmacophore model file
+        query_molecule: SMILES string or file path
+        weight: Dictionary of feature weights
+        is_smiles_query: Boolean indicating if query is SMILES
+        num_conformers: Number of conformers to generate
+        
+    Returns:
+        Tuple of (model_path, score)
+    """
+    try:
+        model = PharmacophoreModel.load(str(model_path))
+        if is_smiles_query:
+            score = model.scoring_smiles(query_molecule, num_conformers, weight)
+        else:
+            score = model.scoring_file(query_molecule, weight)
+        return str(model_path), score
+    except Exception as e:
+        print(f"Error processing {model_path}: {e}", file=sys.stderr)
+        return str(model_path), -1.0
+
+
+def parse_query_csv(csv_path):
+    """Parse CSV with query molecules
     
-    - name: Validate input files
-      run: |
-        echo "Checking input files..."
-        
-        if [ ! -f input/pdb_database.csv ]; then
-          echo "ERROR: input/pdb_database.csv not found!"
-          exit 1
-        fi
-        
-        if [ ! -f input/query_molecules.csv ]; then
-          echo "ERROR: input/query_molecules.csv not found!"
-          exit 1
-        fi
-        
-        # Check if CSVs have content
-        PDB_LINES=$(wc -l < input/pdb_database.csv)
-        QUERY_LINES=$(wc -l < input/query_molecules.csv)
-        
-        if [ "$PDB_LINES" -lt 2 ]; then
-          echo "ERROR: pdb_database.csv is empty or has only header!"
-          exit 1
-        fi
-        
-        if [ "$QUERY_LINES" -lt 2 ]; then
-          echo "ERROR: query_molecules.csv is empty or has only header!"
-          exit 1
-        fi
-        
-        echo "✓ Input files validated"
-        echo "  PDB entries: $((PDB_LINES - 1))"
-        echo "  Query molecules: $((QUERY_LINES - 1))"
+    Expected format:
+    Name,SMILES
+    CBN,C1=CC=C2C(=C1)...
+    THC,CC(C)C1=CC2=C(...
     
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+    OR:
+    Name,File
+    CBN,molecules/CBN.sdf
+    THC,molecules/THC.sdf
     
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          libxrender1 \
-          libxext6 \
-          libsm6 \
-          libgl1
+    Args:
+        csv_path: Path to CSV file
+        
+    Returns:
+        List of dictionaries with keys: name, query, is_smiles
+    """
+    queries = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row.get('Name', row.get('name', ''))
+            smiles = row.get('SMILES', row.get('smiles', ''))
+            file_path = row.get('File', row.get('file', ''))
+            
+            if not name:
+                print(f"Warning: Skipping row with missing name: {row}", file=sys.stderr)
+                continue
+            
+            if smiles:
+                queries.append({'name': name, 'query': smiles, 'is_smiles': True})
+            elif file_path:
+                if not Path(file_path).exists():
+                    print(f"Warning: File not found for {name}: {file_path}", file=sys.stderr)
+                    continue
+                queries.append({'name': name, 'query': file_path, 'is_smiles': False})
+            else:
+                print(f"Warning: Skipping {name} - no SMILES or File provided", file=sys.stderr)
     
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install rdkit pandas matplotlib seaborn scikit-learn biopython
-        
-        # Install PharmacoNet if setup.py exists
-        if [ -f setup.py ]; then
-          pip install -e .
-        else
-          echo "WARNING: setup.py not found, skipping pmnet installation"
-        fi
+    return queries
+
+
+def main():
+    parser = ReverseScreening_ArgParser()
+    args = parser.parse_args()
+
+    # Validate input
+    if not args.query_molecule and not args.query_csv:
+        parser.error("Must provide either --query_molecule or --query_csv")
+    if args.query_molecule and args.query_csv:
+        parser.error("Cannot use both --query_molecule and --query_csv")
+
+    # Parse queries
+    if args.query_csv:
+        print(f"Loading queries from CSV: {args.query_csv}")
+        queries = parse_query_csv(args.query_csv)
+        if not queries:
+            print("ERROR: No valid queries found in CSV file!")
+            sys.exit(1)
+        print(f"Found {len(queries)} query molecules")
+    else:
+        # Single query
+        is_smiles_query = is_smiles(args.query_molecule)
+        queries = [{
+            'name': 'Query',
+            'query': args.query_molecule,
+            'is_smiles': is_smiles_query
+        }]
+        if is_smiles_query:
+            print(f"Query molecule (SMILES): {args.query_molecule}")
+        else:
+            print(f"Query molecule (file): {args.query_molecule}")
+
+    # Find all .pm files in database directory
+    database_path = Path(args.model_database_dir)
+    if not database_path.exists():
+        print(f"ERROR: Database directory not found: {args.model_database_dir}")
+        sys.exit(1)
     
-    - name: Verify installation
-      run: |
-        python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-        python -c "import rdkit; print(f'RDKit: {rdkit.__version__}')"
-        python -c "import pandas; print(f'Pandas: {pandas.__version__}')"
-        
-        # Check if pmnet is available
-        if python -c "import pmnet" 2>/dev/null; then
-          python -c "import pmnet; print(f'PharmacoNet: {pmnet.__version__}')"
-        else
-          echo "WARNING: pmnet module not found (this is okay if using standalone scripts)"
-        fi
+    model_list = list(database_path.rglob("*.pm"))
+    print(f"Found {len(model_list)} pharmacophore models in database")
+
+    if len(model_list) == 0:
+        print("ERROR: No .pm files found in database directory!")
+        print(f"Please run batch_modeling.py first to build the database.")
+        sys.exit(1)
+
+    # Prepare weights
+    weight = dict(
+        Cation=args.cation,
+        Anion=args.anion,
+        Aromatic=args.aromatic,
+        HBond_donor=args.hbd,
+        HBond_acceptor=args.hba,
+        Halogen=args.halogen,
+        Hydrophobic=args.hydrophobic,
+    )
+
+    print(f"\nFeature weights:")
+    for feat, w in weight.items():
+        print(f"  {feat:20s}: {w}")
+
+    # Process all queries
+    all_results = []
     
-    - name: Count input entries
-      id: count_inputs
-      run: |
-        PDB_COUNT=$(tail -n +2 input/pdb_database.csv | wc -l)
-        QUERY_COUNT=$(tail -n +2 input/query_molecules.csv | wc -l)
-        echo "pdb_count=$PDB_COUNT" >> $GITHUB_OUTPUT
-        echo "query_count=$QUERY_COUNT" >> $GITHUB_OUTPUT
-        echo "Found $PDB_COUNT proteins and $QUERY_COUNT query molecules"
+    for query_idx, query_info in enumerate(queries, start=1):
+        query_name = query_info['name']
+        query_molecule = query_info['query']
+        is_smiles_query = query_info['is_smiles']
+        
+        print(f"\n{'='*80}")
+        print(f"Processing query {query_idx}/{len(queries)}: {query_name}")
+        print(f"{'='*80}")
+        
+        # Score query molecule against all models
+        print(f"Screening against {len(model_list)} protein models...")
+        f = partial(
+            score_model,
+            query_molecule=query_molecule,
+            weight=weight,
+            is_smiles_query=is_smiles_query,
+            num_conformers=args.num_conformers,
+        )
+
+        with multiprocessing.Pool(args.cpus) as pool:
+            result = pool.map(f, model_list)
+
+        # Filter by minimum score
+        result = [(path, score) for path, score in result if score >= args.min_score]
+
+        # Sort by score (descending - highest score first)
+        result.sort(key=lambda x: x[1], reverse=True)
+
+        # Apply top_n filter if specified
+        if args.top_n is not None:
+            result = result[: args.top_n]
+
+        # Add query name to results
+        for model_path, score in result:
+            all_results.append((query_name, model_path, score))
+
+        # Print top 10 for this query
+        print(f"\nTOP 10 MATCHING PROTEINS for {query_name}:")
+        print("-" * 80)
+        if result:
+            for rank, (model_path, score) in enumerate(result[:10], start=1):
+                model_name = Path(model_path).stem
+                print(f"{rank:3d}. {model_name:50s} Score: {score:8.4f}")
+        else:
+            print("  No matches found (all scores below threshold)")
+
+    # Save all results
+    print(f"\n{'='*80}")
+    print(f"Saving {len(all_results)} total results to {args.out}")
+    print(f"{'='*80}")
     
-    - name: Create output directories
-      run: |
-        mkdir -p output
-        mkdir -p results
-        mkdir -p results/analysis
+    # Create output directory if needed
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     
-    - name: Build protein pharmacophore database
-      id: build_database
-      continue-on-error: true
-      run: |
-        echo "Building pharmacophore models for ${{ steps.count_inputs.outputs.pdb_count }} proteins..."
-        echo "This may take several hours for large databases."
-        
-        if [ -f batch_modeling.py ]; then
-          python batch_modeling.py \
-            --input_csv input/pdb_database.csv \
-            --output_dir output \
-            2>&1 | tee build_database.log
-        else
-          echo "ERROR: batch_modeling.py not found!"
-          echo "Please add batch_modeling.py to your repository"
-          exit 1
-        fi
-        
-        # Count generated models
-        MODEL_COUNT=$(find output -name "*.pm" 2>/dev/null | wc -l)
-        echo "model_count=$MODEL_COUNT" >> $GITHUB_OUTPUT
-        echo "Generated $MODEL_COUNT pharmacophore models"
+    with open(args.out, "w", newline='') as w:
+        writer = csv.writer(w)
+        writer.writerow(["query_name", "pharmacophore_model", "score"])
+        for query_name, model_path, score in all_results:
+            writer.writerow([query_name, model_path, score])
+
+    print("\nReverse screening complete! ✓")
+    print(f"Results saved to: {args.out}")
     
-    - name: Validate database
-      run: |
-        MODEL_COUNT=${{ steps.build_database.outputs.model_count }}
-        
-        if [ "$MODEL_COUNT" = "" ] || [ "$MODEL_COUNT" -eq 0 ]; then
-          echo "ERROR: No pharmacophore models were generated!"
-          echo ""
-          echo "Possible causes:"
-          echo "1. batch_modeling.py failed to run"
-          echo "2. Invalid PDB codes in pdb_database.csv"
-          echo "3. Network issues downloading PDB files"
-          echo "4. Python environment issues"
-          echo ""
-          echo "Check build_database.log for details"
-          
-          if [ -f build_database.log ]; then
-            echo ""
-            echo "Last 50 lines of build_database.log:"
-            tail -50 build_database.log
-          fi
-          
-          exit 1
-        fi
-        
-        echo "✓ Database validation passed: $MODEL_COUNT models"
-    
-    - name: Run reverse screening
-      continue-on-error: true
-      run: |
-        NUM_CONFORMERS=${{ github.event.inputs.num_conformers || '50' }}
-        MIN_SCORE=${{ github.event.inputs.min_score || '5.0' }}
-        TOP_N=${{ github.event.inputs.top_n || '50' }}
-        
-        echo "Running reverse screening with:"
-        echo "  Conformers: $NUM_CONFORMERS"
-        echo "  Min score: $MIN_SCORE"
-        echo "  Top N: $TOP_N"
-        echo "  CPUs: $(nproc)"
-        
-        if [ -f reverse_screening.py ]; then
-          python reverse_screening.py \
-            --query_csv input/query_molecules.csv \
-            --model_database_dir output \
-            --out results/screening_results.csv \
-            --num_conformers $NUM_CONFORMERS \
-            --min_score $MIN_SCORE \
-            --top_n $TOP_N \
-            --cpus $(nproc) \
-            2>&1 | tee screening.log
-        else
-          echo "ERROR: reverse_screening.py not found!"
-          exit 1
-        fi
-    
-    - name: Analyze results
-      continue-on-error: true
-      run: |
-        if [ ! -f results/screening_results.csv ]; then
-          echo "ERROR: Screening results not found!"
-          exit 1
-        fi
-        
-        RESULT_COUNT=$(tail -n +2 results/screening_results.csv 2>/dev/null | wc -l)
-        echo "Found $RESULT_COUNT screening results"
-        
-        if [ "$RESULT_COUNT" -eq 0 ]; then
-          echo "WARNING: No screening results (all scores below threshold)"
-          mkdir -p results/analysis
-          echo "No results found - all scores below threshold" > results/analysis/analysis_report.txt
-        else
-          echo "Analyzing results..."
-          if [ -f scripts/analyze_results.py ]; then
-            python scripts/analyze_results.py results/screening_results.csv \
-              --output_dir results/analysis \
-              2>&1 | tee analysis.log
-          else
-            echo "WARNING: scripts/analyze_results.py not found, skipping analysis"
-          fi
-        fi
-    
-    - name: Generate summary report
-      run: |
-        cat > results/SUMMARY.md << EOF
-        # PharmacoNet Reverse Screening Results
-        
-        ## Run Information
-        - **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-        - **Workflow:** ${{ github.workflow }}
-        - **Run ID:** ${{ github.run_id }}
-        - **Commit:** ${{ github.sha }}
-        
-        ## Input Summary
-        - **Proteins in database:** ${{ steps.count_inputs.outputs.pdb_count }}
-        - **Pharmacophore models generated:** ${{ steps.build_database.outputs.model_count }}
-        - **Query molecules:** ${{ steps.count_inputs.outputs.query_count }}
-        
-        ## Screening Parameters
-        - **Conformers per molecule:** ${{ github.event.inputs.num_conformers || '50' }}
-        - **Minimum score threshold:** ${{ github.event.inputs.min_score || '5.0' }}
-        - **Top N per query:** ${{ github.event.inputs.top_n || '50' }}
-        - **CPUs used:** $(nproc)
-        
-        ## Output Files
-        EOF
-        
-        if [ -f results/screening_results.csv ]; then
-          echo "- \`screening_results.csv\` - Raw screening results" >> results/SUMMARY.md
-        fi
-        
-        if [ -f results/analysis/score_distribution.png ]; then
-          echo "- \`analysis/score_distribution.png\` - Score distribution plot" >> results/SUMMARY.md
-        fi
-        
-        if [ -f results/screening_results.csv ]; then
-          echo "" >> results/SUMMARY.md
-          echo "### Top 5 Matches (Highest Scores)" >> results/SUMMARY.md
-          echo '```' >> results/SUMMARY.md
-          head -6 results/screening_results.csv | column -t -s',' >> results/SUMMARY.md || head -6 results/screening_results.csv >> results/SUMMARY.md
-          echo '```' >> results/SUMMARY.md
-        fi
-        
-        cat results/SUMMARY.md
-    
-    - name: Upload screening results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: screening-results-${{ github.run_id }}
-        path: |
-          results/
-        retention-days: 90
-    
-    - name: Upload pharmacophore models
-      uses: actions/upload-artifact@v4
-      if: success()
-      with:
-        name: pharmacophore-models-${{ github.run_id }}
-        path: |
-          output/**/*.pm
-        retention-days: 30
-    
-    - name: Upload logs
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: logs-${{ github.run_id }}
-        path: |
-          *.log
-        retention-days: 30
+    # Summary statistics
+    if all_results:
+        scores = [score for _, _, score in all_results]
+        print(f"\nScore Statistics:")
+        print(f"  Total matches: {len(all_results)}")
+        print(f"  Max score: {max(scores):.4f}")
+        print(f"  Min score: {min(scores):.4f}")
+        print(f"  Average score: {sum(scores)/len(scores):.4f}")
+
+
+if __name__ == "__main__":
+    main()
